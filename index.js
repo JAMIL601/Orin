@@ -979,6 +979,7 @@ app.post("/start", (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
 
   botRunning = true;
+  manualStop = false;
   createBot();
   addLog("[Control] Bot started");
 
@@ -989,6 +990,9 @@ app.post("/stop", (req, res) => {
   if (!botRunning) return res.json({ success: false, msg: "Already stopped" });
 
   botRunning = false;
+  manualStop = true;
+  if (hourlyLeaveTimer) { clearTimeout(hourlyLeaveTimer); hourlyLeaveTimer = null; }
+  clearBotTimeouts();
 
   if (bot) {
     bot.end();
@@ -1135,6 +1139,8 @@ let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
 let isReconnecting = false;
+let hourlyLeaveTimer = null;
+let manualStop = false;
 
 function clearBotTimeouts() {
   if (reconnectTimeoutId) {
@@ -1164,24 +1170,15 @@ function addInterval(callback, delay) {
 }
 
 function getReconnectDelay() {
+  // Fixed 5-second retry for ordinary disconnects. Respect explicit
+  // server-side throttling instead of repeatedly sending rejected joins.
   if (botState.wasThrottled) {
     botState.wasThrottled = false;
-    const throttleDelay = 60000 + Math.floor(Math.random() * 60000);
-    addLog(
-      `[Bot] Throttle detected - using extended delay: ${throttleDelay / 1000}s`,
-    );
+    const throttleDelay = 5 * 60 * 1000;
+    addLog("[Bot] Server rate-limit detected; respecting a 5-minute cooldown.");
     return throttleDelay;
   }
-
-  // FIX: read auto-reconnect-delay from settings as base delay
-  const baseDelay = config.utils["auto-reconnect-delay"] || 3000;
-  const maxDelay = config.utils["max-reconnect-delay"] || 30000;
-  const delay = Math.min(
-    baseDelay * Math.pow(2, botState.reconnectAttempts),
-    maxDelay,
-  );
-  const jitter = Math.floor(Math.random() * 2000);
-  return delay + jitter;
+  return 5000;
 }
 
 function createBot() {
@@ -1253,6 +1250,13 @@ function createBot() {
       botState.lastActivity = Date.now();
       botState.reconnectAttempts = 0;
       isReconnecting = false;
+      if (hourlyLeaveTimer) clearTimeout(hourlyLeaveTimer);
+      hourlyLeaveTimer = setTimeout(() => {
+        if (!botRunning || !botState.connected || !bot) return;
+        addLog("[Bot] One-hour session complete; performing scheduled reconnect.");
+        try { bot.quit("Scheduled one-hour reconnect"); }
+        catch (e) { addLog(`[Bot] Scheduled quit error: ${e.message}`); }
+      }, 60 * 60 * 1000);
 
       addLog(
         `[Bot] [+] Successfully spawned on server! (Version: ${bot.version})`,
@@ -1337,6 +1341,7 @@ function createBot() {
     bot.on("end", (reason) => {
       addLog(`[Bot] Disconnected: ${reason || "Unknown reason"}`);
       botState.connected = false;
+      if (hourlyLeaveTimer) { clearTimeout(hourlyLeaveTimer); hourlyLeaveTimer = null; }
       clearAllIntervals();
       spawnHandled = false; // reset for next connection
 
@@ -1351,8 +1356,8 @@ function createBot() {
         );
       }
 
-      // ALWAYS reconnect — bot must never leave the server
-      scheduleReconnect();
+      // Reconnect only while the dashboard's Start state is active.
+      if (botRunning && !manualStop) scheduleReconnect();
     });
 
     bot.on("error", (err) => {
@@ -1369,6 +1374,7 @@ function createBot() {
 
 function scheduleReconnect() {
   clearBotTimeouts();
+  if (!botRunning || manualStop) return;
 
   // FIX: don't stack reconnect if already waiting
   if (isReconnecting) {
@@ -1387,7 +1393,7 @@ function scheduleReconnect() {
   reconnectTimeoutId = setTimeout(() => {
     reconnectTimeoutId = null;
     isReconnecting = false;
-    createBot();
+    if (botRunning && !manualStop) createBot();
   }, delay);
 }
 
@@ -1625,8 +1631,75 @@ function initializeModules(bot, mcData, defaultMove) {
   if (config.modules.chat) {
     chatModule(bot);
   }
+  if (config.modules.adventure !== false) {
+    adventureModule(bot, mcData, defaultMove);
+  }
 
   addLog("[Modules] All modules initialized!");
+}
+
+// ============================================================
+// LIGHTWEIGHT ADVENTURE MODULE
+// Explores nearby terrain and walks toward dropped items so Mineflayer can
+// collect them naturally. It does not attack players or place blocks by itself.
+// ============================================================
+function adventureModule(bot, mcData, defaultMove) {
+  let lastTargetAt = 0;
+  let exploring = false;
+
+  const explore = () => {
+    if (!botState.connected || !bot.entity || exploring) return;
+    const now = Date.now();
+    if (now - lastTargetAt < 25000) return;
+    try {
+      const drops = Object.values(bot.entities).filter(
+        (e) => e && e.name === "item" && e.position && bot.entity.position.distanceTo(e.position) < 18
+      );
+      let target;
+      if (drops.length) {
+        drops.sort((a, b) => bot.entity.position.distanceTo(a.position) - bot.entity.position.distanceTo(b.position));
+        target = drops[0].position;
+        addLog("[Adventure] Walking toward a nearby dropped item.");
+      } else {
+        const angle = Math.random() * Math.PI * 2;
+        const distance = 8 + Math.floor(Math.random() * 13);
+        target = {
+          x: Math.floor(bot.entity.position.x + Math.cos(angle) * distance),
+          y: Math.floor(bot.entity.position.y),
+          z: Math.floor(bot.entity.position.z + Math.sin(angle) * distance)
+        };
+        addLog("[Adventure] Exploring a nearby direction.");
+      }
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(new GoalBlock(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z)));
+      exploring = true;
+      lastTargetAt = now;
+      botState.lastActivity = now;
+    } catch (e) { addLog(`[Adventure] Explore error: ${e.message}`); }
+  };
+
+  bot.on("goal_reached", () => { exploring = false; });
+  bot.on("path_reset", () => { exploring = false; });
+  addInterval(() => {
+    if (!botState.connected || !bot.entity) return;
+    exploring = false;
+    explore();
+  }, 30000);
+
+  // !gift throws one inventory item toward the requesting player. Minecraft
+  // does not allow a normal client bot to insert items directly into inventory.
+  bot.on("chat", async (username, message) => {
+    if (!botState.connected || username === bot.username || message.trim().toLowerCase() !== "!gift") return;
+    try {
+      const player = bot.players[username];
+      if (!player || !player.entity || !player.entity.position) return;
+      const item = bot.inventory.items()[0];
+      if (!item) { bot.chat(`${username}, I don't have anything to give right now.`); return; }
+      await bot.lookAt(player.entity.position.offset(0, 1, 0), true);
+      await bot.toss(item.type, item.metadata, 1);
+      addLog(`[Adventure] Dropped ${item.name} for ${username}.`);
+    } catch (e) { addLog(`[Adventure] Gift error: ${e.message}`); }
+  });
 }
 
 // ============================================================
